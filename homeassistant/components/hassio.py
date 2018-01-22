@@ -12,17 +12,21 @@ import re
 
 import aiohttp
 from aiohttp import web
-from aiohttp.web_exceptions import HTTPBadGateway
 from aiohttp.hdrs import CONTENT_TYPE
+from aiohttp.web_exceptions import HTTPBadGateway
 import async_timeout
 import voluptuous as vol
 
-import homeassistant.helpers.config_validation as cv
-from homeassistant.const import (
-    CONTENT_TYPE_TEXT_PLAIN, SERVER_PORT, CONF_TIME_ZONE)
+from homeassistant.components import SERVICE_CHECK_CONFIG
 from homeassistant.components.http import (
-    HomeAssistantView, KEY_AUTHENTICATED, CONF_API_PASSWORD, CONF_SERVER_PORT,
-    CONF_SERVER_HOST, CONF_SSL_CERTIFICATE)
+    CONF_API_PASSWORD, CONF_SERVER_HOST, CONF_SERVER_PORT,
+    CONF_SSL_CERTIFICATE, KEY_AUTHENTICATED, HomeAssistantView)
+from homeassistant.const import (
+    CONF_TIME_ZONE, CONTENT_TYPE_TEXT_PLAIN, SERVER_PORT,
+    SERVICE_HOMEASSISTANT_RESTART, SERVICE_HOMEASSISTANT_STOP)
+from homeassistant.core import DOMAIN as HASS_DOMAIN
+from homeassistant.core import callback
+import homeassistant.helpers.config_validation as cv
 from homeassistant.loader import bind_hass
 from homeassistant.util.dt import utcnow
 
@@ -34,7 +38,7 @@ DEPENDENCIES = ['http']
 X_HASSIO = 'X-HASSIO-KEY'
 
 DATA_HOMEASSISTANT_VERSION = 'hassio_hass_version'
-HASSIO_UPDATE_INTERVAL = timedelta(hours=1)
+HASSIO_UPDATE_INTERVAL = timedelta(minutes=55)
 
 SERVICE_ADDON_START = 'addon_start'
 SERVICE_ADDON_STOP = 'addon_stop'
@@ -120,26 +124,54 @@ MAP_SERVICE_API = {
 }
 
 
+@callback
 @bind_hass
 def get_homeassistant_version(hass):
-    """Return last available HomeAssistant version."""
+    """Return latest available Home Assistant version.
+
+    Async friendly.
+    """
     return hass.data.get(DATA_HOMEASSISTANT_VERSION)
+
+
+@callback
+@bind_hass
+def is_hassio(hass):
+    """Return true if hass.io is loaded.
+
+    Async friendly.
+    """
+    return DOMAIN in hass.config.components
+
+
+@bind_hass
+@asyncio.coroutine
+def async_check_config(hass):
+    """Check configuration over Hass.io API."""
+    result = yield from hass.data[DOMAIN].send_command(
+        '/homeassistant/check', timeout=300)
+
+    if not result:
+        return "Hass.io config check API error"
+    elif result['result'] == "error":
+        return result['message']
+    return None
 
 
 @asyncio.coroutine
 def async_setup(hass, config):
-    """Set up the HASSio component."""
+    """Set up the Hass.io component."""
     try:
         host = os.environ['HASSIO']
     except KeyError:
-        _LOGGER.error("No HassIO supervisor detect!")
+        _LOGGER.error("No Hass.io supervisor detect")
         return False
 
     websession = hass.helpers.aiohttp_client.async_get_clientsession()
-    hassio = HassIO(hass.loop, websession, host)
+    hass.data[DOMAIN] = hassio = HassIO(hass.loop, websession, host)
 
     if not (yield from hassio.is_connected()):
-        _LOGGER.error("Not connected with HassIO!")
+        _LOGGER.error("Not connected with Hass.io")
         return False
 
     hass.http.register_view(HassIOView(hassio))
@@ -156,7 +188,7 @@ def async_setup(hass, config):
 
     @asyncio.coroutine
     def async_service_handler(service):
-        """Handle service calls for HassIO."""
+        """Handle service calls for Hass.io."""
         api_command = MAP_SERVICE_API[service.service][0]
         data = service.data.copy()
         addon = data.pop(ATTR_ADDON, None)
@@ -170,10 +202,13 @@ def async_setup(hass, config):
             payload = data
 
         # Call API
-        yield from hassio.send_command(
+        ret = yield from hassio.send_command(
             api_command.format(addon=addon, snapshot=snapshot),
             payload=payload, timeout=MAP_SERVICE_API[service.service][2]
         )
+
+        if not ret or ret['result'] != "ok":
+            _LOGGER.error("Error on Hass.io API: %s", ret['message'])
 
     for service, settings in MAP_SERVICE_API.items():
         hass.services.async_register(
@@ -181,7 +216,7 @@ def async_setup(hass, config):
 
     @asyncio.coroutine
     def update_homeassistant_version(now):
-        """Update last available HomeAssistant version."""
+        """Update last available Home Assistant version."""
         data = yield from hassio.get_homeassistant_info()
         if data:
             hass.data[DATA_HOMEASSISTANT_VERSION] = \
@@ -193,34 +228,71 @@ def async_setup(hass, config):
     # Fetch last version
     yield from update_homeassistant_version(None)
 
+    @asyncio.coroutine
+    def async_handle_core_service(call):
+        """Service handler for handling core services."""
+        if call.service == SERVICE_HOMEASSISTANT_STOP:
+            yield from hassio.send_command('/homeassistant/stop')
+            return
+
+        error = yield from async_check_config(hass)
+        if error:
+            _LOGGER.error(error)
+            hass.components.persistent_notification.async_create(
+                "Config error. See dev-info panel for details.",
+                "Config validating", "{0}.check_config".format(HASS_DOMAIN))
+            return
+
+        if call.service == SERVICE_HOMEASSISTANT_RESTART:
+            yield from hassio.send_command('/homeassistant/restart')
+
+    # Mock core services
+    for service in (SERVICE_HOMEASSISTANT_STOP, SERVICE_HOMEASSISTANT_RESTART,
+                    SERVICE_CHECK_CONFIG):
+        hass.services.async_register(
+            HASS_DOMAIN, service, async_handle_core_service)
+
     return True
 
 
+def _api_bool(funct):
+    """Return a boolean."""
+    @asyncio.coroutine
+    def _wrapper(*argv, **kwargs):
+        """Wrap function."""
+        data = yield from funct(*argv, **kwargs)
+        return data and data['result'] == "ok"
+
+    return _wrapper
+
+
 class HassIO(object):
-    """Small API wrapper for HassIO."""
+    """Small API wrapper for Hass.io."""
 
     def __init__(self, loop, websession, ip):
-        """Initialze HassIO api."""
+        """Initialize Hass.io API."""
         self.loop = loop
         self.websession = websession
         self._ip = ip
 
+    @_api_bool
     def is_connected(self):
-        """Return True if it connected to HassIO supervisor.
+        """Return true if it connected to Hass.io supervisor.
 
         This method return a coroutine.
         """
         return self.send_command("/supervisor/ping", method="get")
 
     def get_homeassistant_info(self):
-        """Return data for HomeAssistant.
+        """Return data for Home Assistant.
 
         This method return a coroutine.
         """
         return self.send_command("/homeassistant/info", method="get")
 
+    @_api_bool
     def update_hass_api(self, http_config):
-        """Update Home-Assistant API data on HassIO.
+        """Update Home Assistant API data on Hass.io.
 
         This method return a coroutine.
         """
@@ -234,12 +306,13 @@ class HassIO(object):
 
         if CONF_SERVER_HOST in http_config:
             options['watchdog'] = False
-            _LOGGER.warning("Don't use 'server_host' options with Hass.io!")
+            _LOGGER.warning("Don't use 'server_host' options with Hass.io")
 
         return self.send_command("/homeassistant/options", payload=options)
 
+    @_api_bool
     def update_hass_timezone(self, core_config):
-        """Update Home-Assistant timezone data on HassIO.
+        """Update Home-Assistant timezone data on Hass.io.
 
         This method return a coroutine.
         """
@@ -249,7 +322,7 @@ class HassIO(object):
 
     @asyncio.coroutine
     def send_command(self, command, method="post", payload=None, timeout=10):
-        """Send API command to HassIO.
+        """Send API command to Hass.io.
 
         This method is a coroutine.
         """
@@ -258,10 +331,10 @@ class HassIO(object):
                 request = yield from self.websession.request(
                     method, "http://{}{}".format(self._ip, command),
                     json=payload, headers={
-                        X_HASSIO: os.environ.get('HASSIO_TOKEN')
+                        X_HASSIO: os.environ.get('HASSIO_TOKEN', "")
                     })
 
-                if request.status != 200:
+                if request.status not in (200, 400):
                     _LOGGER.error(
                         "%s return code %d.", command, request.status)
                     return None
@@ -279,7 +352,7 @@ class HassIO(object):
 
     @asyncio.coroutine
     def command_proxy(self, path, request):
-        """Return a client request with proxy origin for HassIO supervisor.
+        """Return a client request with proxy origin for Hass.io supervisor.
 
         This method is a coroutine.
         """
@@ -287,7 +360,7 @@ class HassIO(object):
 
         try:
             data = None
-            headers = {X_HASSIO: os.environ.get('HASSIO_TOKEN')}
+            headers = {X_HASSIO: os.environ.get('HASSIO_TOKEN', "")}
             with async_timeout.timeout(10, loop=self.loop):
                 data = yield from request.read()
                 if data:
@@ -304,28 +377,28 @@ class HassIO(object):
             return client
 
         except aiohttp.ClientError as err:
-            _LOGGER.error("Client error on api %s request %s.", path, err)
+            _LOGGER.error("Client error on api %s request %s", path, err)
 
         except asyncio.TimeoutError:
-            _LOGGER.error("Client timeout error on api request %s.", path)
+            _LOGGER.error("Client timeout error on API request %s", path)
 
         raise HTTPBadGateway()
 
 
 class HassIOView(HomeAssistantView):
-    """HassIO view to handle base part."""
+    """Hass.io view to handle base part."""
 
     name = "api:hassio"
     url = "/api/hassio/{path:.+}"
     requires_auth = False
 
     def __init__(self, hassio):
-        """Initialize a hassio base view."""
+        """Initialize a Hass.io base view."""
         self.hassio = hassio
 
     @asyncio.coroutine
     def _handle(self, request, path):
-        """Route data to hassio."""
+        """Route data to Hass.io."""
         if _need_auth(path) and not request[KEY_AUTHENTICATED]:
             return web.Response(status=401)
 
@@ -362,7 +435,7 @@ def _create_response_log(client, data):
 
 
 def _get_timeout(path):
-    """Return timeout for a url path."""
+    """Return timeout for a URL path."""
     for re_path in NO_TIMEOUT:
         if re_path.match(path):
             return 0
@@ -370,7 +443,7 @@ def _get_timeout(path):
 
 
 def _need_auth(path):
-    """Return if a path need a auth."""
+    """Return if a path need authentication."""
     for re_path in NO_AUTH:
         if re_path.match(path):
             return False
